@@ -1,0 +1,24 @@
+{
+  "name": "@cucu/plugin-redis-grants",
+  "version": "0.0.1",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf dist node_modules"
+  },
+  "dependencies": {
+    "@apollo/server": "^4.5.0",
+    "rxjs": "^7.8.1"
+  },
+  "peerDependencies": {
+    "@nestjs/microservices": "^10.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.2.2",
+    "rimraf": "^5.0.0"
+  }
+}
