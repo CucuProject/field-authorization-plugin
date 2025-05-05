@@ -6,12 +6,12 @@ import {
   GraphQLRequestContextWillSendResponse,
 } from '@apollo/server';
 
-import { Algorithm, JwtPayload, verify } from 'jsonwebtoken';
-import jwksRsa, { JwksClient } from 'jwks-rsa';
-import { lastValueFrom, Observable } from 'rxjs';
+import { Algorithm, verify } from 'jsonwebtoken';
+import jwksRsa from 'jwks-rsa';
+import { Observable, lastValueFrom } from 'rxjs';
 
 /* -------------------------------------------------------------------------
- * 1) Tipi provenienti dal microservizio "grants" (semplificati)
+ * 1) Tipi provenienti dal microservizio "grants"
  * ----------------------------------------------------------------------- */
 interface FieldPermission {
   fieldPath: string;
@@ -33,36 +33,28 @@ export interface GrantsClientLike {
 
 /* -------------------------------------------------------------------------
  * 3) Configurazione Keycloak M2M
- *    Se vuoi validare la firma RS256 del token M2M
  * ----------------------------------------------------------------------- */
 export interface M2MVerificationConfig {
-  jwksUri: string;             // es: "http://keycloak:8080/realms/myrealm/protocol/openid-connect/certs"
-  issuer: string;              // es: "http://keycloak:8080/realms/myrealm"
-  audience: string;            // il client_id registrato su Keycloak
-  allowedAlgos?: string[];     // default: ['RS256']
+  jwksUri: string;          // "http://keycloak:8080/realms/myrealm/protocol/openid-connect/certs"
+  issuer: string;           // "http://keycloak:8080/realms/myrealm"
+  audience: string;         // il client_id registrato su Keycloak
+  allowedAlgos?: string[];  // default: ['RS256']
 }
 
 /* -------------------------------------------------------------------------
  * 4) Opzioni del plugin
  * ----------------------------------------------------------------------- */
 export interface GrantsAuthPluginOptions {
-  grantsClient: GrantsClientLike;
-  entityName  : string;
-  /**
-   * Funzione per parsare l’header “x-user-groups” (di default, split su virgola).
-   */
+  grantsClient: GrantsClientLike;         // Necessario per send(...) a GRANTS
+  entityName  : string;                   // "User", "Project", "Auth", etc.
   parseGroupIds?: (raw?: string | null) => string[];
-
-  /**
-   * Se definito, useremo questi parametri per validare via JWT RS256
-   * le richieste con “Authorization: Bearer <token>”.
-   */
   m2mVerificationConfig?: M2MVerificationConfig;
 }
 
 /* -------------------------------------------------------------------------
- * 5) Utilities
+ * 5) Helpers
  * ----------------------------------------------------------------------- */
+
 /** Parser di default per x-user-groups */
 function defaultParseGroups(raw?: string|null): string[] {
   return raw
@@ -129,31 +121,27 @@ async function fetchViewable(
     .catch(() => new Set<string>());
 }
 
-/* -------------------------------------------------------------------------
- * 6) Verifica M2M: uso di jwks-rsa e verify() di jsonwebtoken
- * ----------------------------------------------------------------------- */
+/** Verifica Bearer M2M via jwks-rsa e jsonwebtoken.verify() */
 async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promise<void> {
-  // Crea client JWKS, con caching
+  // Crea un client JWKS con caching
   const jwksClient = jwksRsa({
     jwksUri: cfg.jwksUri,
     cache: true,
-    cacheMaxAge: 60000,
+    cacheMaxAge: 60_000,
   });
 
+  // Sostituisce la chiave “on the fly”
   const getKey = (header: any, callback: (err: any, key?: string) => void) => {
     jwksClient.getSigningKey(header.kid, (err, key) => {
-      if (err) {
-        return callback(err);
-      }
+      if (err) return callback(err);
       if (!key) {
-        return callback(new Error('No signing key found for kid=' + header.kid));
+        return callback(new Error(`No signing key found for kid=${header.kid}`));
       }
       const signingKey = key.getPublicKey();
       callback(null, signingKey);
     });
   };
 
-  // Prepara la lista di algos
   const chosenAlgos = (cfg.allowedAlgos || ['RS256']) as Algorithm[];
 
   return new Promise((resolve, reject) => {
@@ -165,13 +153,10 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
         issuer: cfg.issuer,
         algorithms: chosenAlgos,
       },
-      (err, decoded) => {
+      (err) => {
         if (err) {
           return reject(err);
         }
-        // se vuoi controllare che “decoded.client_id” esista
-        // (NB: Keycloak a volte mette client_id in "azp" o "clientId", dipende dalla config)
-        // a tua scelta:
         resolve();
       },
     );
@@ -179,62 +164,78 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
 }
 
 /* -------------------------------------------------------------------------
- * 7) Plugin “createGrantsAuthorizationPlugin”
+ * 6) Plugin “createGrantsAuthorizationPlugin”
  * ----------------------------------------------------------------------- */
 export function createGrantsAuthorizationPlugin(
   opts: GrantsAuthPluginOptions,
 ): ApolloServerPlugin<BaseContext> {
+
   const parseGroups = opts.parseGroupIds ?? defaultParseGroups;
   const m2mConfig   = opts.m2mVerificationConfig;
 
   return {
     async requestDidStart() {
+
       return <GraphQLRequestListener<BaseContext>> {
         // ----------------------------------------
-        // A) canExecute => didResolveOperation
+        // A) “canExecute” => didResolveOperation
         // ----------------------------------------
         async didResolveOperation(rc: GraphQLRequestContextDidResolveOperation<BaseContext>) {
+
           const headers = rc.request.http?.headers;
           if (!headers) return;
 
-          // Controlla se c’è un token Bearer
+          const opName =
+            rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+
+          /* --- 1) Se abbiamo Bearer => check M2M --- */
           const authHeader = headers.get('authorization') || '';
           if (authHeader.toLowerCase().startsWith('bearer ')) {
+            if (!m2mConfig) {
+              throw new Error(
+                '[GrantsAuthPlugin] Bearer present, but no m2mVerificationConfig provided.',
+              );
+            }
             const token = authHeader.split(' ')[1];
-
-            // Se abbiamo config M2M => verifichiamo la firma
-            if (m2mConfig) {
-              try {
-                await verifyM2MToken(token, m2mConfig);
-                // => se ok => skip i controlli Grants (return)
-                return;
-              } catch (err) {
-                // se token M2M invalido => blocchiamo
-                throw new Error(
-                  `[GrantsAuthPlugin] M2M token invalid: ${(err as Error).message}`,
-                );
-              }
-            } else {
-              // se non c’è config => skip (fiducia)
+            try {
+              await verifyM2MToken(token, m2mConfig);
+              // Se M2M è valido => skip x-user-groups => “canExecute” con token M2M
               return;
+            } catch (err) {
+              throw new Error(
+                `[GrantsAuthPlugin] M2M token invalid: ${(err as Error).message}`,
+              );
             }
           }
 
-          // Altrimenti, se non Bearer => assumiamo FE => ci servono x-user-groups
-          const groups = parseGroups(headers.get('x-user-groups'));
-          if (!groups.length) {
-            throw new Error('[GrantsAuthPlugin] x-user-groups mancante');
+          /* --- 2) Altrimenti, parse “x-user-groups” --- */
+          const rawGroups = headers.get('x-user-groups');
+          if (!rawGroups) {
+            // Qui blocchiamo se manca Bearer e manca x-user-groups
+            // Se desideri bypassare introspezione, potresti fare un check su
+            // if (['_service', '_entities'].includes(opName)) { return; }
+            // Altrimenti errore
+            throw new Error(
+              `[GrantsAuthPlugin] No Bearer token and no x-user-groups => Denied (op=${opName}).`,
+            );
           }
 
-          // Ora, check canExecute
-          const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+          // parse groupIds
+          const groups = parseGroups(rawGroups);
+          if (!groups.length) {
+            throw new Error(
+              '[GrantsAuthPlugin] “x-user-groups” is empty => denied.',
+            );
+          }
+
+          // check canExecute
           const allowed = await Promise.any(
             groups.map(g => checkCanExecute(opts.grantsClient, g, opName)),
           ).catch(() => false);
 
           if (!allowed) {
             throw new Error(
-              `[GrantsAuthPlugin] Operazione "${opName}" negata per gruppi ${groups.join(',')}`,
+              `[GrantsAuthPlugin] Operation "${opName}" not allowed for groups=${groups.join(',')}`,
             );
           }
         },
@@ -243,42 +244,35 @@ export function createGrantsAuthorizationPlugin(
         // B) field-level filtering => willSendResponse
         // ----------------------------------------
         async willSendResponse(rc: GraphQLRequestContextWillSendResponse<BaseContext>) {
+          // Se la risposta non è “single” => skip
           if (rc.response.body.kind !== 'single') return;
           const data = rc.response.body.singleResult.data;
-          if (!data) return;
+          if (!data) return; // no data => skip
 
           const headers = rc.request.http?.headers;
           if (!headers) return;
 
-          // Se c’è Bearer => verifichiamo M2M
+          // Se c’è Bearer => skip field filtering
           const authHeader = headers.get('authorization') || '';
           if (authHeader.toLowerCase().startsWith('bearer ')) {
-            const token = authHeader.split(' ')[1];
-            if (m2mConfig) {
-              try {
-                await verifyM2MToken(token, m2mConfig);
-                // se ok => skip field filtering
-                return;
-              } catch (err) {
-                throw new Error(`[GrantsAuthPlugin] M2M token invalid: ${(err as Error).message}`);
-              }
-            } else {
-              // no config => skip
-              return;
-            }
+            return;
           }
 
           // Altrimenti => x-user-groups
           const groups = parseGroups(headers.get('x-user-groups'));
-          if (!groups.length) return; // se mancano => non filtra (o potresti filtrare tutto)
+          if (!groups.length) {
+            // se non c’è => potresti bloccare o azzerare data
+            return;
+          }
 
-          // Colleziona tutti i fieldPaths viewable
+          // fetch “viewable” fieldPaths
           const union = new Set<string>();
           for (const g of groups) {
             const viewable = await fetchViewable(opts.grantsClient, g, opts.entityName);
             viewable.forEach(path => union.add(path));
           }
 
+          // Rimuovi i campi non inclusi in union
           removeDisallowed(data, union);
         },
       };
