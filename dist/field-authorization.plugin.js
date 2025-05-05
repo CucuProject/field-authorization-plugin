@@ -95,14 +95,18 @@ function createGrantsAuthorizationPlugin(opts) {
     const m2mConfig = opts.m2mVerificationConfig;
     return {
         async requestDidStart() {
+            console.log('[GrantsAuthPlugin] requestDidStart fired');
             return {
                 // ----------------------------------------------
                 // A) canExecute => didResolveOperation
                 // ----------------------------------------------
                 async didResolveOperation(rc) {
+                    console.log('[GrantsAuthPlugin] didResolveOperation: START');
                     const headers = rc.request.http?.headers;
-                    if (!headers)
+                    if (!headers) {
+                        console.log('[GrantsAuthPlugin] No headers => skip');
                         return;
+                    }
                     const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
                     /** 1) Check se x-internal-federation-call=1 */
                     const fedFlag = headers.get('x-internal-federation-call');

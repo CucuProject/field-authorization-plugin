@@ -160,13 +160,22 @@ export function createGrantsAuthorizationPlugin(
   return {
     async requestDidStart() {
 
+      console.log('[GrantsAuthPlugin] requestDidStart fired');
+
       return <GraphQLRequestListener<BaseContext>> {
         // ----------------------------------------------
         // A) canExecute => didResolveOperation
         // ----------------------------------------------
         async didResolveOperation(rc: GraphQLRequestContextDidResolveOperation<BaseContext>) {
+
+          console.log('[GrantsAuthPlugin] didResolveOperation: START');
+
           const headers = rc.request.http?.headers;
-          if (!headers) return;
+          if (!headers) {
+            console.log('[GrantsAuthPlugin] No headers => skip');
+
+            return;
+          }
 
           const opName =
             rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
