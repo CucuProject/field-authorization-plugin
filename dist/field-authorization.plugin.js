@@ -57,6 +57,8 @@ async function fetchViewable(client, groupId, entityName) {
  * Accetta audience come string o come lista.
  */
 async function verifyM2MToken(token, cfg) {
+    console.log('[GrantsAuthPlugin] verifyM2MToken START');
+    console.log(`[GrantsAuthPlugin] Using jwksUri=${cfg.jwksUri}, issuer=${cfg.issuer}, audience=`, cfg.audience);
     const jwksClient = (0, jwks_rsa_1.default)({
         jwksUri: cfg.jwksUri,
         cache: true,
@@ -64,25 +66,29 @@ async function verifyM2MToken(token, cfg) {
     });
     const getKey = (header, callback) => {
         jwksClient.getSigningKey(header.kid, (err, key) => {
-            if (err)
+            if (err) {
+                console.error('[GrantsAuthPlugin] getSigningKey error =>', err);
                 return callback(err);
-            if (!key)
+            }
+            if (!key) {
+                console.error(`[GrantsAuthPlugin] No signing key found for kid=${header.kid}`);
                 return callback(new Error(`No signing key for kid=${header.kid}`));
+            }
             callback(null, key.getPublicKey());
         });
     };
     const chosenAlgos = (cfg.allowedAlgos || ['RS256']);
     return new Promise((resolve, reject) => {
         (0, jsonwebtoken_1.verify)(token, getKey, {
-            // Qui passiamo la `cfg.audience`, che può essere string oppure array.
-            // Se Keycloak emette aud="my-service" oppure aud=["gateway-service","my-service"],
-            // e "my-service" è nella lista, la verifica passa.
             audience: cfg.audience,
             issuer: cfg.issuer,
             algorithms: chosenAlgos,
         }, (err) => {
-            if (err)
+            if (err) {
+                console.error('[GrantsAuthPlugin] verifyM2MToken => jwt.verify error =>', err);
                 return reject(err);
+            }
+            console.log('[GrantsAuthPlugin] verifyM2MToken => OK');
             resolve();
         });
     });
@@ -93,6 +99,7 @@ async function verifyM2MToken(token, cfg) {
 function createGrantsAuthorizationPlugin(opts) {
     const parseGroups = opts.parseGroupIds ?? defaultParseGroups;
     const m2mConfig = opts.m2mVerificationConfig;
+    console.log('[GrantsAuthPlugin] createGrantsAuthorizationPlugin => m2mConfig=', m2mConfig);
     return {
         async requestDidStart() {
             console.log('[GrantsAuthPlugin] requestDidStart fired');
@@ -102,102 +109,127 @@ function createGrantsAuthorizationPlugin(opts) {
                 // ----------------------------------------------
                 async didResolveOperation(rc) {
                     console.log('[GrantsAuthPlugin] didResolveOperation: START');
-                    const headers = rc.request.http?.headers;
-                    if (!headers) {
-                        console.log('[GrantsAuthPlugin] No headers => skip');
-                        return;
-                    }
-                    const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-                    /** 1) Check se x-internal-federation-call=1 */
-                    const fedFlag = headers.get('x-internal-federation-call');
-                    if (fedFlag === '1') {
-                        // → DEVE essere presente Bearer M2M e valido
-                        if (!m2mConfig) {
-                            throw new Error('[GrantsAuthPlugin] x-internal-federation-call=1 ma manca m2mVerificationConfig');
-                        }
-                        const authHeader = headers.get('authorization') || '';
-                        if (!authHeader.toLowerCase().startsWith('bearer ')) {
-                            throw new Error('[GrantsAuthPlugin] Missing Bearer in x-internal-federation-call => denied');
-                        }
-                        // Verifichiamo M2M
-                        const token = authHeader.split(' ')[1];
-                        try {
-                            await verifyM2MToken(token, m2mConfig);
-                        }
-                        catch (err) {
-                            throw new Error(`[GrantsAuthPlugin] Federation Bearer M2M invalid: ${err.message}`);
-                        }
-                        // se ok => skip i controlli su group
-                        return;
-                    }
-                    /** 2) Se non è federation-call, controlliamo Bearer M2M (facoltativo) */
-                    const authHeader = headers.get('authorization') || '';
-                    if (authHeader.toLowerCase().startsWith('bearer ')) {
-                        if (!m2mConfig) {
-                            throw new Error('[GrantsAuthPlugin] Bearer found, but no m2mVerificationConfig provided.');
-                        }
-                        const token = authHeader.split(' ')[1];
-                        try {
-                            await verifyM2MToken(token, m2mConfig);
-                            // Se token M2M è valido, saltiamo i controlli x-user-groups
+                    try {
+                        const headers = rc.request.http?.headers;
+                        if (!headers) {
+                            console.log('[GrantsAuthPlugin] No headers => skip');
                             return;
                         }
-                        catch (err) {
-                            throw new Error(`[GrantsAuthPlugin] M2M token invalid: ${err.message}`);
+                        const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+                        console.log(`[GrantsAuthPlugin] didResolveOperation => opName="${opName}"`);
+                        /** 1) Check se x-internal-federation-call=1 */
+                        const fedFlag = headers.get('x-internal-federation-call');
+                        console.log('[GrantsAuthPlugin] x-internal-federation-call =>', fedFlag);
+                        if (fedFlag === '1') {
+                            console.log('[GrantsAuthPlugin] Federation internal call => verifying M2M token');
+                            if (!m2mConfig) {
+                                throw new Error('[GrantsAuthPlugin] x-internal-federation-call=1 ma manca m2mVerificationConfig');
+                            }
+                            const authHeader = headers.get('authorization') || '';
+                            if (!authHeader.toLowerCase().startsWith('bearer ')) {
+                                throw new Error('[GrantsAuthPlugin] Missing Bearer in x-internal-federation-call => denied');
+                            }
+                            const token = authHeader.split(' ')[1];
+                            await verifyM2MToken(token, m2mConfig);
+                            console.log('[GrantsAuthPlugin] Federation M2M token => OK, skip group checks');
+                            return;
                         }
+                        /** 2) Se non è federation-call, controlliamo Bearer M2M (facoltativo) */
+                        const authHeader = headers.get('authorization') || '';
+                        if (authHeader.toLowerCase().startsWith('bearer ')) {
+                            console.log('[GrantsAuthPlugin] Found Bearer => verifying M2M token');
+                            if (!m2mConfig) {
+                                throw new Error('[GrantsAuthPlugin] Bearer found, but no m2mVerificationConfig provided.');
+                            }
+                            const token = authHeader.split(' ')[1];
+                            await verifyM2MToken(token, m2mConfig);
+                            console.log('[GrantsAuthPlugin] M2M token => OK => skip x-user-groups checks');
+                            return;
+                        }
+                        /** 3) Altrimenti => parse x-user-groups */
+                        console.log('[GrantsAuthPlugin] No bearer => expecting x-user-groups for FE calls');
+                        const rawGroups = headers.get('x-user-groups');
+                        if (!rawGroups) {
+                            throw new Error(`[GrantsAuthPlugin] No Bearer and no x-user-groups => denied. (opName=${opName})`);
+                        }
+                        const groups = parseGroups(rawGroups);
+                        console.log(`[GrantsAuthPlugin] x-user-groups => [${groups.join(', ')}]`);
+                        if (!groups.length) {
+                            throw new Error('[GrantsAuthPlugin] x-user-groups is empty => denied.');
+                        }
+                        // check canExecute
+                        const allowed = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName))).catch(() => false);
+                        console.log('[GrantsAuthPlugin] canExecute =>', allowed);
+                        if (!allowed) {
+                            throw new Error(`[GrantsAuthPlugin] Operation "${opName}" not allowed for groups=${groups.join(',')}`);
+                        }
+                        console.log('[GrantsAuthPlugin] didResolveOperation => OK');
                     }
-                    /** 3) Altrimenti => parse x-user-groups */
-                    const rawGroups = headers.get('x-user-groups');
-                    if (!rawGroups) {
-                        throw new Error(`[GrantsAuthPlugin] No Bearer and no x-user-groups => denied. (opName=${opName})`);
-                    }
-                    const groups = parseGroups(rawGroups);
-                    if (!groups.length) {
-                        throw new Error('[GrantsAuthPlugin] x-user-groups is empty => denied.');
-                    }
-                    // check canExecute
-                    const allowed = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName))).catch(() => false);
-                    if (!allowed) {
-                        throw new Error(`[GrantsAuthPlugin] Operation "${opName}" not allowed for groups=${groups.join(',')}`);
+                    catch (err) {
+                        console.error('[GrantsAuthPlugin] didResolveOperation => ERROR:', err);
+                        throw err;
                     }
                 },
                 // ----------------------------------------------
                 // B) field-level filtering => willSendResponse
                 // ----------------------------------------------
                 async willSendResponse(rc) {
-                    if (rc.response.body.kind !== 'single')
-                        return;
-                    const data = rc.response.body.singleResult.data;
-                    if (!data)
-                        return;
-                    const headers = rc.request.http?.headers;
-                    if (!headers)
-                        return;
-                    // 1) Federation call? skip
-                    if (headers.get('x-internal-federation-call') === '1') {
-                        // (già verificato Bearer M2M sopra)
-                        return;
+                    console.log('[GrantsAuthPlugin] willSendResponse: START');
+                    try {
+                        if (rc.response.body.kind !== 'single') {
+                            console.log('[GrantsAuthPlugin] Response is not "single" => skip');
+                            return;
+                        }
+                        const data = rc.response.body.singleResult.data;
+                        if (!data) {
+                            console.log('[GrantsAuthPlugin] No data => skip');
+                            return;
+                        }
+                        const headers = rc.request.http?.headers;
+                        if (!headers) {
+                            console.log('[GrantsAuthPlugin] No headers => skip');
+                            return;
+                        }
+                        // 1) Federation call? skip
+                        const fedFlag = headers.get('x-internal-federation-call');
+                        if (fedFlag === '1') {
+                            console.log('[GrantsAuthPlugin] Federation call => skip field filtering');
+                            return;
+                        }
+                        // 2) M2M Bearer? skip
+                        const authHeader = headers.get('authorization') || '';
+                        if (authHeader.toLowerCase().startsWith('bearer ')) {
+                            console.log('[GrantsAuthPlugin] M2M bearer => skip field filtering');
+                            return;
+                        }
+                        // 3) parse groups
+                        const rawGroups = headers.get('x-user-groups');
+                        if (!rawGroups) {
+                            console.log('[GrantsAuthPlugin] No x-user-groups => skip or clear data?');
+                            return;
+                        }
+                        const groups = defaultParseGroups(rawGroups);
+                        console.log('[GrantsAuthPlugin] field-level => groups are:', groups);
+                        if (!groups.length) {
+                            console.log('[GrantsAuthPlugin] groups is empty => skip filtering');
+                            return;
+                        }
+                        // fetch fieldPaths
+                        console.log('[GrantsAuthPlugin] fetching fieldPaths => entityName=', opts.entityName);
+                        const union = new Set();
+                        for (const g of groups) {
+                            const viewable = await fetchViewable(opts.grantsClient, g, opts.entityName);
+                            viewable.forEach(path => union.add(path));
+                        }
+                        console.log('[GrantsAuthPlugin] final union =>', union);
+                        // rimuovi i campi non inclusi
+                        removeDisallowed(data, union);
+                        console.log('[GrantsAuthPlugin] removed disallowed fields => done');
                     }
-                    // 2) M2M Bearer? skip
-                    const authHeader = headers.get('authorization') || '';
-                    if (authHeader.toLowerCase().startsWith('bearer ')) {
-                        return;
+                    catch (err) {
+                        console.error('[GrantsAuthPlugin] willSendResponse => ERROR:', err);
+                        throw err;
                     }
-                    // 3) parse groups
-                    const rawGroups = headers.get('x-user-groups');
-                    if (!rawGroups)
-                        return; // nessun group => potresti forzare data = {}
-                    const groups = parseGroups(rawGroups);
-                    if (!groups.length)
-                        return;
-                    // fetch fieldPaths
-                    const union = new Set();
-                    for (const g of groups) {
-                        const viewable = await fetchViewable(opts.grantsClient, g, opts.entityName);
-                        viewable.forEach(path => union.add(path));
-                    }
-                    // rimuovi i campi non inclusi
-                    removeDisallowed(data, union);
                 },
             };
         },
