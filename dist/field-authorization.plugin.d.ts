@@ -6,7 +6,7 @@ export interface GrantsClientLike {
 export interface M2MVerificationConfig {
     jwksUri: string;
     issuer: string;
-    audience: string;
+    audience: string | string[];
     allowedAlgos?: string[];
 }
 export interface GrantsAuthPluginOptions {

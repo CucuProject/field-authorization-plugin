@@ -31,12 +31,13 @@ export interface GrantsClientLike {
 
 /* -------------------------------------------------------------------------
  * 3) Configurazione Keycloak M2M
+ *    (con audience che può essere string | string[])
  * ----------------------------------------------------------------------- */
 export interface M2MVerificationConfig {
-  jwksUri      : string;   // es. "http://keycloak:8080/realms/myrealm/protocol/openid-connect/certs"
-  issuer       : string;   // es. "http://keycloak:8080/realms/myrealm"
-  audience     : string;   // client_id su Keycloak
-  allowedAlgos?: string[]; // default: ['RS256']
+  jwksUri      : string;            // es: "http://keycloak:8080/realms/myrealm/protocol/openid-connect/certs"
+  issuer       : string;            // es: "http://keycloak:8080/realms/myrealm"
+  audience     : string | string[]; // client_id su Keycloak, oppure elenco di possibili audience
+  allowedAlgos?: string[];          // default: ['RS256']
 }
 
 /* -------------------------------------------------------------------------
@@ -107,11 +108,14 @@ async function fetchViewable(
     .catch(() => new Set<string>());
 }
 
-/** Verifica Bearer M2M via jwks-rsa e jsonwebtoken.verify() */
+/**
+ * Verifica Bearer M2M via jwks-rsa e jsonwebtoken.verify().
+ * Accetta audience come string o come lista.
+ */
 async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promise<void> {
   const jwksClient = jwksRsa({
-    jwksUri: cfg.jwksUri,
-    cache  : true,
+    jwksUri    : cfg.jwksUri,
+    cache      : true,
     cacheMaxAge: 60_000,
   });
   const getKey = (header: any, callback: (err: any, key?: string) => void) => {
@@ -128,6 +132,9 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
       token,
       getKey,
       {
+        // Qui passiamo la `cfg.audience`, che può essere string oppure array.
+        // Se Keycloak emette aud="my-service" oppure aud=["gateway-service","my-service"],
+        // e "my-service" è nella lista, la verifica passa.
         audience: cfg.audience,
         issuer  : cfg.issuer,
         algorithms: chosenAlgos,
@@ -203,7 +210,8 @@ export function createGrantsAuthorizationPlugin(
             const token = authHeader.split(' ')[1];
             try {
               await verifyM2MToken(token, m2mConfig);
-              return; // skip x-user-groups
+              // Se token M2M è valido, saltiamo i controlli x-user-groups
+              return;
             } catch (err) {
               throw new Error(
                 `[GrantsAuthPlugin] M2M token invalid: ${(err as Error).message}`,

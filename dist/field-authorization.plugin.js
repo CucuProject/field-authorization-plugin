@@ -52,7 +52,10 @@ async function fetchViewable(client, groupId, entityName) {
         .then(list => new Set(list.filter(p => p.canView).map(p => p.fieldPath)))
         .catch(() => new Set());
 }
-/** Verifica Bearer M2M via jwks-rsa e jsonwebtoken.verify() */
+/**
+ * Verifica Bearer M2M via jwks-rsa e jsonwebtoken.verify().
+ * Accetta audience come string o come lista.
+ */
 async function verifyM2MToken(token, cfg) {
     const jwksClient = (0, jwks_rsa_1.default)({
         jwksUri: cfg.jwksUri,
@@ -71,6 +74,9 @@ async function verifyM2MToken(token, cfg) {
     const chosenAlgos = (cfg.allowedAlgos || ['RS256']);
     return new Promise((resolve, reject) => {
         (0, jsonwebtoken_1.verify)(token, getKey, {
+            // Qui passiamo la `cfg.audience`, che può essere string oppure array.
+            // Se Keycloak emette aud="my-service" oppure aud=["gateway-service","my-service"],
+            // e "my-service" è nella lista, la verifica passa.
             audience: cfg.audience,
             issuer: cfg.issuer,
             algorithms: chosenAlgos,
@@ -129,7 +135,8 @@ function createGrantsAuthorizationPlugin(opts) {
                         const token = authHeader.split(' ')[1];
                         try {
                             await verifyM2MToken(token, m2mConfig);
-                            return; // skip x-user-groups
+                            // Se token M2M è valido, saltiamo i controlli x-user-groups
+                            return;
                         }
                         catch (err) {
                             throw new Error(`[GrantsAuthPlugin] M2M token invalid: ${err.message}`);
