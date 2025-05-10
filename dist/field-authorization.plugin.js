@@ -113,79 +113,126 @@ function createGrantsAuthorizationPlugin(opts) {
                 // A) canExecute => didResolveOperation
                 // ----------------------------------------------
                 async didResolveOperation(rc) {
+                    console.log('[GrantsPlugin] didResolveOperation - start, opName=', rc.operationName);
                     const headers = rc.request.http?.headers;
-                    if (!headers)
-                        return;
-                    const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-                    // 1) Se è un'operazione di Federation => bypass
-                    if (FEDERATION_OPS.has(opName)) {
+                    if (!headers) {
+                        console.log('[GrantsPlugin] didResolveOperation - no headers; skipping');
                         return;
                     }
-                    // 2) Se c’è Bearer => M2M check
+                    const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+                    console.log('[GrantsPlugin] opName =', opName);
+                    // 1) Federation?
+                    if (FEDERATION_OPS.has(opName)) {
+                        console.log('[GrantsPlugin] opName is Federation => bypass');
+                        return;
+                    }
+                    // 2) Bearer => M2M
                     const authHeader = headers.get('authorization') || '';
+                    console.log('[GrantsPlugin] authorization=', authHeader);
                     if (authHeader.toLowerCase().startsWith('bearer ')) {
+                        console.log('[GrantsPlugin] Bearer token => verifying as M2M...');
                         if (!m2mConfig) {
                             throw new Error('Bearer token presente, ma manca m2mVerificationConfig');
                         }
                         const token = authHeader.split(' ')[1];
-                        await verifyM2MToken(token, m2mConfig);
-                        // => se verifica ok => saltiamo x-user-groups
-                        return;
+                        try {
+                            await verifyM2MToken(token, m2mConfig);
+                            console.log('[GrantsPlugin] M2M token verify OK => skip x-user-groups check');
+                            return;
+                        }
+                        catch (err) {
+                            console.log('[GrantsPlugin] M2M token verify ERROR =>', err);
+                            throw err;
+                        }
                     }
                     // 3) Altrimenti => x-user-groups
                     const rawGroups = headers.get('x-user-groups');
+                    console.log('[GrantsPlugin] x-user-groups=', rawGroups);
                     if (!rawGroups) {
+                        console.log('[GrantsPlugin] => NO x-user-groups => throw error');
                         throw new Error(`[GrantsAuthPlugin] Nessun Bearer token e nessun x-user-groups => denied (op=${opName})`);
                     }
+                    // parse
                     const groups = parseGroups(rawGroups);
+                    console.log('[GrantsPlugin] parsed groups=', groups);
                     if (!groups.length) {
+                        console.log('[GrantsPlugin] groups è array vuoto => denied');
                         throw new Error(`[GrantsAuthPlugin] x-user-groups è vuoto => denied.`);
                     }
-                    // check canExecute su almeno un gruppo
-                    const canExe = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName))).catch(() => false);
+                    console.log(`[GrantsPlugin] => checking canExecute for op="${opName}"`);
+                    let canExe = false;
+                    try {
+                        // Promise.any => se TUTTI danno false => catch
+                        canExe = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName)));
+                        console.log('[GrantsPlugin] canExe =>', canExe);
+                    }
+                    catch (err) {
+                        // se *tutte* le promise rifiutano, o .any() entra qui
+                        console.log('[GrantsPlugin] promise.any => false =>', err);
+                        canExe = false;
+                    }
                     if (!canExe) {
+                        console.log(`[GrantsPlugin] => not allowed to execute "${opName}" => throw error`);
                         throw new Error(`[GrantsAuthPlugin] Operazione "${opName}" non consentita per i gruppi [${groups.join(',')}]`);
                     }
+                    console.log('[GrantsPlugin] => didResolveOperation OK => continuing');
                 },
                 // ----------------------------------------------
                 // B) field-level filtering => willSendResponse
                 // ----------------------------------------------
                 async willSendResponse(rc) {
-                    if (rc.response.body.kind !== 'single')
+                    console.log('[GrantsPlugin] willSendResponse - start');
+                    if (rc.response.body.kind !== 'single') {
+                        console.log('[GrantsPlugin] willSendResponse => not single => skip');
                         return;
+                    }
                     const data = rc.response.body.singleResult.data;
-                    if (!data)
+                    console.log('[GrantsPlugin] data keys =', data && Object.keys(data));
+                    if (!data) {
+                        console.log('[GrantsPlugin] no data => skip');
                         return;
+                    }
                     const headers = rc.request.http?.headers;
-                    if (!headers)
+                    if (!headers) {
+                        console.log('[GrantsPlugin] no headers => skip');
                         return;
-                    // 1) Se Federation => bypass
+                    }
                     const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+                    console.log('[GrantsPlugin] opName =', opName);
                     if (FEDERATION_OPS.has(opName)) {
+                        console.log('[GrantsPlugin] federation => skip');
                         return;
                     }
-                    // 2) Se Bearer => skip
+                    // check Bearer
                     const authHeader = headers.get('authorization') || '';
+                    console.log('[GrantsPlugin] authHeader =', authHeader);
                     if (authHeader.toLowerCase().startsWith('bearer ')) {
+                        console.log('[GrantsPlugin] Bearer => skip field filtering');
                         return;
                     }
-                    // 3) parse groups
+                    // parse x-user-groups
                     const rawGroups = headers.get('x-user-groups');
+                    console.log('[GrantsPlugin] x-user-groups =', rawGroups);
                     if (!rawGroups) {
-                        return; // nessun group => non filtra
+                        console.log('[GrantsPlugin] => skip because no groups');
+                        return;
                     }
                     const groups = parseGroups(rawGroups);
                     if (!groups.length) {
-                        return; // se vuoto => nessun filtering
+                        console.log('[GrantsPlugin] => skip because groups[] is empty');
+                        return;
                     }
-                    // fetch fieldPaths “viewable”
+                    console.log('[GrantsPlugin] => fetching fieldPermissions from grants...');
                     const union = new Set();
                     for (const g of groups) {
+                        // potresti loggare g
                         const viewable = await fetchViewable(opts.grantsClient, g, opts.entityName);
+                        console.log('[GrantsPlugin] group=', g, 'viewable =', viewable);
                         viewable.forEach(path => union.add(path));
                     }
-                    // Rimuove i campi non inclusi
+                    console.log('[GrantsPlugin] union of fieldPaths =', union);
                     removeDisallowed(data, union);
+                    console.log('[GrantsPlugin] => data post removeDisallowed =', data);
                 },
             };
         },
