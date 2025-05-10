@@ -119,14 +119,18 @@ function createGrantsAuthorizationPlugin(opts) {
                         console.log('[GrantsPlugin] didResolveOperation - no headers; skipping');
                         return;
                     }
+                    // 1) Ricava l’opName “grezzo” dal Federation
                     const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-                    console.log('[GrantsPlugin] opName =', opName);
-                    // 1) Federation?
+                    // 2) (Facoltativo) Rimuove eventuali suffissi Federation, es: "__users__0"
+                    //    se vuoi usare un “nome base” più pulito:
+                    let baseOpName = opName.replace(/__\w+__\d+$/, '');
+                    console.log('[GrantsPlugin] opName =', opName, ' => baseOpName =', baseOpName);
+                    // Se è un'operazione di Federation => bypass
                     if (FEDERATION_OPS.has(opName)) {
                         console.log('[GrantsPlugin] opName is Federation => bypass');
                         return;
                     }
-                    // 2) Bearer => M2M
+                    // 2) Bearer => M2M check
                     const authHeader = headers.get('authorization') || '';
                     console.log('[GrantsPlugin] authorization=', authHeader);
                     if (authHeader.toLowerCase().startsWith('bearer ')) {
@@ -152,32 +156,29 @@ function createGrantsAuthorizationPlugin(opts) {
                         console.log('[GrantsPlugin] => NO x-user-groups => throw error');
                         throw new Error(`[GrantsAuthPlugin] Nessun Bearer token e nessun x-user-groups => denied (op=${opName})`);
                     }
-                    // parse
                     const groups = parseGroups(rawGroups);
                     console.log('[GrantsPlugin] parsed groups=', groups);
                     if (!groups.length) {
                         console.log('[GrantsPlugin] groups è array vuoto => denied');
                         throw new Error(`[GrantsAuthPlugin] x-user-groups è vuoto => denied.`);
                     }
-                    console.log(`[GrantsPlugin] => checking canExecute for op="${opName}"`);
+                    console.log(`[GrantsPlugin] => checking canExecute for op="${baseOpName}"`);
                     let canExe = false;
                     try {
-                        // Promise.any => se TUTTI danno false => catch
-                        canExe = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName)));
+                        // Passa baseOpName invece di opName, se le tue permission in DB si aspettano "findAllUsers" anziché "findAllUsers__users__0"
+                        canExe = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, baseOpName)));
                         console.log('[GrantsPlugin] canExe =>', canExe);
                     }
                     catch (err) {
-                        // se *tutte* le promise rifiutano, o .any() entra qui
                         console.log('[GrantsPlugin] promise.any => false =>', err);
                         canExe = false;
                     }
                     if (!canExe) {
-                        console.log(`[GrantsPlugin] => not allowed to execute "${opName}" => throw error`);
-                        throw new Error(`[GrantsAuthPlugin] Operazione "${opName}" non consentita per i gruppi [${groups.join(',')}]`);
+                        console.log(`[GrantsPlugin] => not allowed to execute "${baseOpName}" => throw error`);
+                        throw new Error(`[GrantsAuthPlugin] Operazione "${baseOpName}" non consentita per i gruppi [${groups.join(',')}]`);
                     }
                     console.log('[GrantsPlugin] => didResolveOperation OK => continuing');
-                },
-                // ----------------------------------------------
+                }, // ----------------------------------------------
                 // B) field-level filtering => willSendResponse
                 // ----------------------------------------------
                 async willSendResponse(rc) {
