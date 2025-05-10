@@ -27,11 +27,11 @@ function removeDisallowed(obj, allowedFields, path = '') {
         return;
     }
     for (const k of Object.keys(obj)) {
-        const subPath = path ? `${path}.${k}` : k;
-        // Manteniamo per convenzione "_id"
-        if (subPath === '_id') {
-            continue;
+        // Se il campo si chiama proprio _id, lo manteniamo comunque
+        if (k === '_id') {
+            continue; // salta il "delete" e passa al successivo
         }
+        const subPath = path ? `${path}.${k}` : k;
         const val = obj[k];
         if (val && typeof val === 'object') {
             removeDisallowed(val, allowedFields, subPath);
@@ -40,6 +40,7 @@ function removeDisallowed(obj, allowedFields, path = '') {
             }
         }
         else {
+            // Se non esiste in allowedFields => rimuovo
             if (!allowedFields.has(subPath)) {
                 delete obj[k];
             }
