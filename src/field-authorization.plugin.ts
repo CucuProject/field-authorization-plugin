@@ -5,24 +5,28 @@ import {
   GraphQLRequestContextDidResolveOperation,
   GraphQLRequestContextWillSendResponse,
 } from '@apollo/server';
+import { Logger } from '@nestjs/common';
 import { verify, Algorithm } from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
 import { Observable, lastValueFrom } from 'rxjs';
 
 /* -------------------------------------------------------------------------
- * 1) Tipi e interfacce
+ * 1) Interfacce e tipi
  * ----------------------------------------------------------------------- */
 interface FieldPermission {
   fieldPath: string;
   canView: boolean;
 }
+
 interface OperationPermission {
   operationName: string;
   canExecute: boolean;
 }
+
 export interface GrantsClientLike {
   send<R = any, D = any>(pattern: any, data: D): Observable<R>;
 }
+
 export interface M2MVerificationConfig {
   jwksUri: string;
   issuer: string;
@@ -31,102 +35,145 @@ export interface M2MVerificationConfig {
 }
 
 /**
- * L’opzione cruciale: "entityNameMap" => { "Group": "Group", "Permission": "Permission", ... }
- * dove la *chiave* è il __typename e il *valore* è come vogliamo che l’entità si chiami in DB grants.
+ * Mappa per la field-level security:
+ *   __typename => nomeEntityUsatoSuDB
+ *
+ * Esempio:
+ *   entityNameMap: {
+ *     User: "User",
+ *     Group: "Group",
+ *     Permission: "Permission",
+ *   }
  */
 export interface MultiEntityGrantsOptions {
   grantsClient: GrantsClientLike;
 
-  // Mappa: __typename => nomeEntityPerDB
   entityNameMap: Record<string, string>;
 
   parseGroupIds?: (raw?: string | null) => string[];
   m2mVerificationConfig?: M2MVerificationConfig;
+
+  /**
+   * Se true, abilita i log (livello debug).
+   * Default = false
+   */
+  debug?: boolean;
 }
 
 /* -------------------------------------------------------------------------
  * 2) Helpers
  * ----------------------------------------------------------------------- */
-// parse x-user-groups di default
+/** parse x-user-groups di default */
 function defaultParseGroups(raw?: string | null): string[] {
   return raw
     ? raw.split(',').map(s => s.trim()).filter(Boolean)
     : [];
 }
 
-// check operazione eseguibile
+/** Verifica se un gruppo ha canExecute su opName */
 async function checkCanExecute(
   client: GrantsClientLike,
   groupId: string,
   opName: string,
+  logger: Logger,
+  debug: boolean,
 ): Promise<boolean> {
-  return lastValueFrom(
-    client.send<OperationPermission[]>('FIND_OP_PERMISSIONS_BY_GROUP', { groupId }),
-  )
-    .then(list => list.some(p => p.operationName === opName && p.canExecute))
-    .catch(() => false);
+  if (debug) logger.debug(`checkCanExecute => groupId="${groupId}", opName="${opName}"`);
+  try {
+    const list = await lastValueFrom(
+      client.send<OperationPermission[]>('FIND_OP_PERMISSIONS_BY_GROUP', { groupId }),
+    );
+    const found = list.some(p => p.operationName === opName && p.canExecute);
+    if (debug) logger.debug(`... groupId="${groupId}", opName="${opName}" => canExecute=${found}`);
+    return found;
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      if (debug) logger.debug(`... checkCanExecute => catch error: ${err?.message || err}`);
+    } else {
+      if (debug) logger.debug(`... checkCanExecute => catch => ${JSON.stringify(err)}`);
+    }
+    return false;
+  }
 }
 
-// Carica i fieldPaths “viewable” (per una data entityName)
+/** Carica i fieldPaths “viewable” (canView) per una data entityName + groupId */
 async function fetchViewable(
   client: GrantsClientLike,
   groupId: string,
   entityName: string,
+  logger: Logger,
+  debug: boolean,
 ): Promise<Set<string>> {
-  return lastValueFrom(
-    client.send<FieldPermission[]>('FIND_PERMISSIONS_BY_GROUP', { groupId, entityName }),
-  )
-    .then(list => new Set(list.filter(p => p.canView).map(p => p.fieldPath)))
-    .catch(() => new Set<string>());
+  if (debug) logger.debug(`fetchViewable => groupId="${groupId}", entityName="${entityName}"`);
+  try {
+    const list = await lastValueFrom(
+      client.send<FieldPermission[]>('FIND_PERMISSIONS_BY_GROUP', { groupId, entityName }),
+    );
+    const viewable = list.filter(p => p.canView).map(p => p.fieldPath);
+    if (debug) logger.debug(`... groupId="${groupId}", entityName="${entityName}" => viewable: [${viewable.join(', ')}]`);
+    return new Set(viewable);
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      if (debug) logger.debug(`... fetchViewable => catch error: ${err?.message || err}`);
+    } else {
+      if (debug) logger.debug(`... fetchViewable => catch => ${JSON.stringify(err)}`);
+    }
+    return new Set<string>();
+  }
 }
 
-/** Rimuove i campi *non consentiti*, basandosi su “allowedMap”. */
+
+/** Rimuove i campi non consentiti in un oggetto con possibili __typename multipli */
 function removeDisallowedMultiEntity(
   obj: any,
-  allowedMap: Record<string, Set<string>>,  // es: { "Group": Set(...), "Permission": Set(...) }
-  defaultAllowed: Set<string>,             // fallback se un __typename non esiste
-  path = ''
+  allowedMap: Record<string, Set<string>>,
+  defaultAllowed: Set<string>,
+  logger: Logger,
+  debug: boolean,
+  path = '',
 ) {
   if (!obj || typeof obj !== 'object') return;
 
   if (Array.isArray(obj)) {
     for (const item of obj) {
-      removeDisallowedMultiEntity(item, allowedMap, defaultAllowed, path);
+      removeDisallowedMultiEntity(item, allowedMap, defaultAllowed, logger, debug, path);
     }
     return;
   }
 
-  // Prova a vedere se esiste un __typename
   const typename = obj.__typename;
   const isKnownEntity = typename && allowedMap[typename];
 
   for (const k of Object.keys(obj)) {
-    // Teniamo i campi speciali se vuoi (es. _id):
+    // Conserviamo _id se serve
     if (k === '_id') continue;
 
     const subPath = path ? `${path}.${k}` : k;
     const val = obj[k];
 
-    // Quale set di fieldPaths usare? se __typename non è conosciuto → fallback
-    const setToUse = isKnownEntity ? allowedMap[typename] : defaultAllowed;
+    // Scegliamo il set di fieldPaths
+    const setToUse = isKnownEntity
+      ? allowedMap[typename]
+      : defaultAllowed;
 
     if (val && typeof val === 'object') {
-      removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, subPath);
-      // se l’oggetto “figlio” è vuoto dopo la pulizia, lo rimuoviamo
+      removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, logger, debug, subPath);
       if (Object.keys(val).length === 0) {
         delete obj[k];
       }
     } else {
-      // se subPath non è nel set → rimuovi
+      // Se subPath NON è presente => cancella
       if (!setToUse.has(subPath)) {
+        if (debug) logger.debug(`remove => "${subPath}" (typename="${typename}" known=${!!isKnownEntity})`);
         delete obj[k];
       }
     }
   }
 }
 
-/** Verifica un token Bearer M2M tramite jwks-rsa */
-async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promise<void> {
+/** Verifica token Bearer M2M */
+async function verifyM2MToken(token: string, cfg: M2MVerificationConfig, logger: Logger, debug: boolean): Promise<void> {
+  if (debug) logger.debug(`verifyM2MToken => issuer="${cfg.issuer}", audience="${cfg.audience}"`);
   const jwksClient = jwksRsa({
     jwksUri: cfg.jwksUri,
     cache: true,
@@ -135,8 +182,12 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
 
   const getKey = (header: any, callback: (err: any, key?: string) => void) => {
     jwksClient.getSigningKey(header.kid, (err, key) => {
-      if (err) return callback(err);
-      if (!key) return callback(new Error(`No signing key found for kid=${header.kid}`));
+      if (err) {
+        return callback(err);
+      }
+      if (!key) {
+        return callback(new Error(`No signing key found for kid=${header.kid}`));
+      }
       callback(null, key.getPublicKey());
     });
   };
@@ -153,7 +204,11 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
         algorithms: algos,
       },
       (err) => {
-        if (err) return reject(err);
+        if (err) {
+          if (debug) logger.debug(`verifyM2MToken => error: ${err?.message || err}`);
+          return reject(err);
+        }
+        if (debug) logger.debug('verifyM2MToken => success');
         resolve();
       },
     );
@@ -166,109 +221,167 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig): Promis
 export function createMultiEntityGrantsPlugin(
   opts: MultiEntityGrantsOptions,
 ): ApolloServerPlugin<BaseContext> {
+  const logger = new Logger('MultiEntityPlugin');  // puoi cambiare la "context label"
+  const debug = !!opts.debug;                      // se non definito => false
   const parseGroups = opts.parseGroupIds ?? defaultParseGroups;
   const m2mConfig   = opts.m2mVerificationConfig;
 
+  // Operazioni "federation"
   const FEDERATION_OPS = new Set([
     '_service',
     '__ApolloGetServiceDefinition__',
     '_entities',
   ]);
 
+  if (debug) {
+    logger.log('createMultiEntityGrantsPlugin => init');
+    logger.debug(`entityNameMap => ${JSON.stringify(opts.entityNameMap, null, 2)}`);
+  }
+
   return {
     async requestDidStart() {
+      if (debug) logger.debug('requestDidStart');
       return <GraphQLRequestListener<BaseContext>>{
-        // A) Controlla canExecute => didResolveOperation
+        /* ------------------------------------------------------
+         * 1) Controllo canExecute => didResolveOperation
+         * ------------------------------------------------------*/
         async didResolveOperation(rc: GraphQLRequestContextDidResolveOperation<BaseContext>) {
+          if (debug) logger.debug('didResolveOperation => start');
+
           const headers = rc.request.http?.headers;
-          if (!headers) return;
+          if (!headers) {
+            if (debug) logger.debug('didResolveOperation => no headers => skip');
+            return;
+          }
 
-          const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-          // Rimuovi “__users__0” e simili
-          const baseOpName = opName.replace(/__\w+__\d+$/, '');
+          // Nome operazione base
+          const rawOpName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+          const opName = rawOpName.replace(/__\w+__\d+$/, '');
+          if (debug) logger.debug(`rawOpName="${rawOpName}" => opName="${opName}"`);
 
-          // Se Federation => bypass
-          if (FEDERATION_OPS.has(opName)) return;
+          if (FEDERATION_OPS.has(rawOpName)) {
+            if (debug) logger.debug('didResolveOperation => federation => bypass');
+            return;
+          }
 
+          // Legge Authorization
           const authHeader = headers.get('authorization') || '';
+          if (debug) logger.debug(`authHeader="${authHeader}"`);
+
           if (authHeader.toLowerCase().startsWith('bearer ')) {
-            // => M2M
+            // M2M
             if (!m2mConfig) {
-              throw new Error('Bearer token ma manca m2mVerificationConfig');
+              throw new Error('Bearer M2M token presente, ma manca m2mVerificationConfig');
             }
             const token = authHeader.split(' ')[1];
-            await verifyM2MToken(token, m2mConfig);
+            await verifyM2MToken(token, m2mConfig, logger, debug);
+            if (debug) logger.debug('M2M => skip x-user-groups');
             return;
           }
 
           // Altrimenti => x-user-groups
           const rawGroups = headers.get('x-user-groups');
           if (!rawGroups) {
-            throw new Error(`[GrantsPlugin] Nessun token M2M e nessun x-user-groups => denied (op=${opName})`);
+            throw new Error(`[GrantsPlugin] Nessun M2M e nessun x-user-groups => denied (op=${opName})`);
           }
           const groups = parseGroups(rawGroups);
+          if (debug) logger.debug(`groups = [${groups.join(', ')}]`);
+
           if (!groups.length) {
-            throw new Error(`[GrantsPlugin] x-user-groups vuoto => denied.`);
+            throw new Error(`[GrantsPlugin] x-user-groups vuoto => denied`);
           }
 
           // check canExecute
           let canExe = false;
           try {
             canExe = await Promise.any(
-              groups.map(g => checkCanExecute(opts.grantsClient, g, baseOpName)),
+              groups.map(g => checkCanExecute(opts.grantsClient, g, opName, logger, debug)),
             );
-          } catch {
+          } catch (err: unknown) {
+            if (err instanceof Error) {
+              if (debug) logger.debug(`promise.any => catch => ${err.message}`);
+            } else {
+              if (debug) logger.debug(`promise.any => catch => ${JSON.stringify(err)}`);
+            }
             canExe = false;
           }
           if (!canExe) {
-            throw new Error(`[GrantsPlugin] Operazione "${baseOpName}" non consentita per i gruppi [${groups.join(',')}]`);
+            if (debug) logger.debug(`op="${opName}" => denied => groups=${groups.join(',')}`);
+            throw new Error(`[GrantsPlugin] Operazione "${opName}" non consentita per i gruppi [${groups.join(',')}]`);
           }
+          if (debug) logger.debug(`op="${opName}" => canExe = true => proceed`);
         },
 
-        // B) field-level filtering => willSendResponse
+        /* ------------------------------------------------------
+         * 2) Field-level => willSendResponse
+         * ------------------------------------------------------*/
         async willSendResponse(rc: GraphQLRequestContextWillSendResponse<BaseContext>) {
-          if (rc.response.body.kind !== 'single') return;
+          if (debug) logger.debug('willSendResponse => start');
+
+          if (rc.response.body.kind !== 'single') {
+            if (debug) logger.debug('... not single => skip');
+            return;
+          }
           const data = rc.response.body.singleResult.data;
-          if (!data) return;
-
+          if (!data) {
+            if (debug) logger.debug('... no data => skip');
+            return;
+          }
           const headers = rc.request.http?.headers;
-          if (!headers) return;
+          if (!headers) {
+            if (debug) logger.debug('... no headers => skip');
+            return;
+          }
 
-          const opName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-          if (FEDERATION_OPS.has(opName)) return;
+          const rawOpName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+          if (FEDERATION_OPS.has(rawOpName)) {
+            if (debug) logger.debug('... federation => skip field filtering');
+            return;
+          }
 
-          // Se Bearer M2M => skip filtering
+          // Se Bearer M2M => skip
           const authHeader = headers.get('authorization') || '';
-          if (authHeader.toLowerCase().startsWith('bearer ')) return;
+          if (authHeader.toLowerCase().startsWith('bearer ')) {
+            if (debug) logger.debug('... bearer M2M => skip field filtering');
+            return;
+          }
 
           // Altrimenti => x-user-groups
           const rawGroups = headers.get('x-user-groups');
-          if (!rawGroups) return; // skip
+          if (!rawGroups) {
+            if (debug) logger.debug('... no x-user-groups => skip');
+            return;
+          }
           const groups = parseGroups(rawGroups);
-          if (!groups.length) return;
+          if (!groups.length) {
+            if (debug) logger.debug('... groups[] empty => skip');
+            return;
+          }
 
-          // Prepara la "allowedMap" per ogni typename
-          // Ad esempio: { "Group": Set(...) , "Permission": Set(...), ... }
-          // e un "defaultAllowed" vuoto => { }
+          // 1) costruiamo "allowedMap" (typename => fieldPaths unione di tutti i groupIds)
           const allowedMap: Record<string, Set<string>> = {};
-          const defaultAllowed = new Set<string>();
+          const defaultAllowed = new Set<string>(); // se non troviamo un typename nella mappa
 
-          // 1) Per ogni typename definito in "entityNameMap"
-          //    Carichiamo i fieldPaths in union (tra i groupIds)
           for (const typename of Object.keys(opts.entityNameMap)) {
             const entityName = opts.entityNameMap[typename];
-
-            // costruiamo la union di fieldPaths "viewable" per tutti i groupIds
+            // union per i vari groupIds
             const unionFields = new Set<string>();
             for (const gId of groups) {
-              const partial = await fetchViewable(opts.grantsClient, gId, entityName);
+              const partial = await fetchViewable(opts.grantsClient, gId, entityName, logger, debug);
               partial.forEach(f => unionFields.add(f));
             }
             allowedMap[typename] = unionFields;
+            if (debug) logger.debug(`typename="${typename}" => unionFields= [${[...unionFields].join(', ')}]`);
           }
 
-          // 2) Rimuovi i campi
-          removeDisallowedMultiEntity(data, allowedMap, defaultAllowed);
+          // 2) rimuoviamo i campi
+          if (debug) {
+            logger.debug(`Data BEFORE filtering:\n${JSON.stringify(data, null, 2)}`);
+          }
+          removeDisallowedMultiEntity(data, allowedMap, defaultAllowed, logger, debug);
+          if (debug) {
+            logger.debug(`Data AFTER filtering:\n${JSON.stringify(data, null, 2)}`);
+          }
         },
       };
     },

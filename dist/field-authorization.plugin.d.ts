@@ -10,13 +10,25 @@ export interface M2MVerificationConfig {
     allowedAlgos?: string[];
 }
 /**
- * L’opzione cruciale: "entityNameMap" => { "Group": "Group", "Permission": "Permission", ... }
- * dove la *chiave* è il __typename e il *valore* è come vogliamo che l’entità si chiami in DB grants.
+ * Mappa per la field-level security:
+ *   __typename => nomeEntityUsatoSuDB
+ *
+ * Esempio:
+ *   entityNameMap: {
+ *     User: "User",
+ *     Group: "Group",
+ *     Permission: "Permission",
+ *   }
  */
 export interface MultiEntityGrantsOptions {
     grantsClient: GrantsClientLike;
     entityNameMap: Record<string, string>;
     parseGroupIds?: (raw?: string | null) => string[];
     m2mVerificationConfig?: M2MVerificationConfig;
+    /**
+     * Se true, abilita i log (livello debug).
+     * Default = false
+     */
+    debug?: boolean;
 }
 export declare function createMultiEntityGrantsPlugin(opts: MultiEntityGrantsOptions): ApolloServerPlugin<BaseContext>;
