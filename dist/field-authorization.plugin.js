@@ -31,7 +31,7 @@ async function checkCanExecute(client, groupId, opName, logger, debug) {
     catch (err) {
         if (err instanceof Error) {
             if (debug)
-                logger.debug(`... checkCanExecute => catch error: ${err?.message || err}`);
+                logger.debug(`... checkCanExecute => catch error: ${err.message}`);
         }
         else {
             if (debug)
@@ -54,7 +54,7 @@ async function fetchViewable(client, groupId, entityName, logger, debug) {
     catch (err) {
         if (err instanceof Error) {
             if (debug)
-                logger.debug(`... fetchViewable => catch error: ${err?.message || err}`);
+                logger.debug(`... fetchViewable => catch error: ${err.message}`);
         }
         else {
             if (debug)
@@ -63,30 +63,36 @@ async function fetchViewable(client, groupId, entityName, logger, debug) {
         return new Set();
     }
 }
-/** Rimuove i campi non consentiti in un oggetto con possibili __typename multipli */
-function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, logger, debug, path = '') {
+/**
+ * Rimuove i campi non consentiti in un oggetto con possibili __typename multipli.
+ * Se l'oggetto figlio **non** ha `__typename`, eredita la `currentTypename` dal genitore.
+ */
+function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, logger, debug, currentTypename, // <-- se manca, si usa defaultAllowed
+path = '') {
     if (!obj || typeof obj !== 'object')
         return;
     if (Array.isArray(obj)) {
         for (const item of obj) {
-            removeDisallowedMultiEntity(item, allowedMap, defaultAllowed, logger, debug, path);
+            removeDisallowedMultiEntity(item, allowedMap, defaultAllowed, logger, debug, currentTypename, path);
         }
         return;
     }
-    const typename = obj.__typename;
+    // Se l'oggetto ha un __typename, usalo. Altrimenti eredita currentTypename
+    const typename = obj.__typename || currentTypename;
     const isKnownEntity = typename && allowedMap[typename];
+    // Scegliamo il set di fieldPaths
+    const setToUse = isKnownEntity
+        ? allowedMap[typename]
+        : defaultAllowed;
     for (const k of Object.keys(obj)) {
-        // Conserviamo _id se serve
+        // Conserviamo _id se vuoi
         if (k === '_id')
             continue;
         const subPath = path ? `${path}.${k}` : k;
         const val = obj[k];
-        // Scegliamo il set di fieldPaths
-        const setToUse = isKnownEntity
-            ? allowedMap[typename]
-            : defaultAllowed;
         if (val && typeof val === 'object') {
-            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, logger, debug, subPath);
+            // Ricorsione. Passiamo la stessa `typename` (o none) in caso di sub-objects
+            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, logger, debug, typename, subPath);
             if (Object.keys(val).length === 0) {
                 delete obj[k];
             }
@@ -94,8 +100,9 @@ function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, logger, de
         else {
             // Se subPath NON è presente => cancella
             if (!setToUse.has(subPath)) {
-                if (debug)
+                if (debug) {
                     logger.debug(`remove => "${subPath}" (typename="${typename}" known=${!!isKnownEntity})`);
+                }
                 delete obj[k];
             }
         }
@@ -302,7 +309,14 @@ function createMultiEntityGrantsPlugin(opts) {
                     if (debug) {
                         logger.debug(`Data BEFORE filtering:\n${JSON.stringify(data, null, 2)}`);
                     }
-                    removeDisallowedMultiEntity(data, allowedMap, defaultAllowed, logger, debug);
+                    /**
+                     * Qui possiamo decidere se passare `undefined` come `currentTypename`,
+                     * oppure, se volessimo interpretare la root come “User” (ad es. in un findAllUsers),
+                     * potremmo farlo. Ma in genere si parte con `undefined` e poi i sub-entities
+                     * di root senza __typename useranno `defaultAllowed`.
+                     */
+                    removeDisallowedMultiEntity(data, allowedMap, defaultAllowed, logger, debug, 
+                    /* currentTypename = */ undefined);
                     if (debug) {
                         logger.debug(`Data AFTER filtering:\n${JSON.stringify(data, null, 2)}`);
                     }
