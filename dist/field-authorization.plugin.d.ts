@@ -9,10 +9,14 @@ export interface M2MVerificationConfig {
     audience: string | string[];
     allowedAlgos?: string[];
 }
-export interface GrantsAuthPluginOptions {
+/**
+ * L’opzione cruciale: "entityNameMap" => { "Group": "Group", "Permission": "Permission", ... }
+ * dove la *chiave* è il __typename e il *valore* è come vogliamo che l’entità si chiami in DB grants.
+ */
+export interface MultiEntityGrantsOptions {
     grantsClient: GrantsClientLike;
-    entityName: string;
+    entityNameMap: Record<string, string>;
     parseGroupIds?: (raw?: string | null) => string[];
     m2mVerificationConfig?: M2MVerificationConfig;
 }
-export declare function createGrantsAuthorizationPlugin(opts: GrantsAuthPluginOptions): ApolloServerPlugin<BaseContext>;
+export declare function createMultiEntityGrantsPlugin(opts: MultiEntityGrantsOptions): ApolloServerPlugin<BaseContext>;
