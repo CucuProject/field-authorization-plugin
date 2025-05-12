@@ -11,7 +11,7 @@ import jwksRsa from 'jwks-rsa';
 import { lastValueFrom } from 'rxjs';
 
 /* -------------------------------------------------------------------------
- * 1) Tipi, interfacce
+ * 1) Tipi e interfacce di base
  * ----------------------------------------------------------------------- */
 interface FieldPermission {
   fieldPath: string;
@@ -27,7 +27,7 @@ export interface GrantsClientLike {
   send<R = any, D = any>(pattern: any, data: D): import('rxjs').Observable<R>;
 }
 
-/** Config per token M2M Keycloak, se lo usi */
+/** Configurazione per la verifica M2M con Keycloak (o simili) */
 export interface M2MVerificationConfig {
   jwksUri: string;
   issuer: string;
@@ -36,8 +36,16 @@ export interface M2MVerificationConfig {
 }
 
 /**
- * Mappa: `__typename => entityName` usato in DB grants,
- * e opzioni per parseGroups, debug, ecc.
+ * Mappa: “__typename => nome usato su DB grants”
+ *
+ * Esempio:
+ * ```ts
+ * entityNameMap: {
+ *   User: "User",
+ *   Group: "Group",
+ *   // ...
+ * }
+ * ```
  */
 export interface MultiEntityGrantsOptions {
   grantsClient: GrantsClientLike;
@@ -52,7 +60,7 @@ export interface MultiEntityGrantsOptions {
 }
 
 /* -------------------------------------------------------------------------
- * 2) Helpers
+ * 2) Helpers per op e field-level
  * ----------------------------------------------------------------------- */
 
 /** parse x-user-groups di default */
@@ -62,7 +70,9 @@ function defaultParseGroups(raw?: string | null): string[] {
     : [];
 }
 
-/** Verifica se groupId ha `canExecute=true` per operation=opName */
+/**
+ * Verifica canExecute su un'operazione
+ */
 async function checkCanExecute(
   client: GrantsClientLike,
   groupId: string,
@@ -70,7 +80,9 @@ async function checkCanExecute(
   logger: Logger,
   debug: boolean,
 ): Promise<boolean> {
-  if (debug) logger.debug(`checkCanExecute => groupId="${groupId}", opName="${opName}"`);
+  if (debug) {
+    logger.debug(`checkCanExecute => groupId="${groupId}", opName="${opName}"`);
+  }
   try {
     const list = await lastValueFrom(
       client.send<OperationPermission[]>('FIND_OP_PERMISSIONS_BY_GROUP', { groupId }),
@@ -88,7 +100,10 @@ async function checkCanExecute(
   }
 }
 
-/** Carica i fieldPaths “viewable” da DB grants, per (groupId, entityName). */
+/**
+ * Carica i fieldPaths “viewable” (canView=true) da DB grants
+ * per (groupId, entityName).
+ */
 async function fetchViewable(
   client: GrantsClientLike,
   groupId: string,
@@ -117,24 +132,30 @@ async function fetchViewable(
 }
 
 /**
- * Rimuove il root field (es. "findAllUsers") se presente come primo
- * segmento. Esempio: "findAllUsers.authData.name" => "authData.name"
+ * Se la prima parte del path corrisponde a un rootField, rimuovila.
+ *
+ * Esempio: "findAllUsers.authData.name"
+ * =>  rootFieldName="findAllUsers"
+ * =>  ritorna "authData.name"
  */
 function stripRootSegment(fullPath: string, rootFieldNames: Set<string>): string {
   const parts = fullPath.split('.');
-  // se la prima parte è inclusa nel set => rimuovila
   if (parts.length > 1 && rootFieldNames.has(parts[0])) {
+    // rimuove la parte iniziale
     parts.shift();
   }
   return parts.join('.');
 }
 
 /**
- * Rimuove i campi non consentiti da `obj`.
- * - allowedMap[typename] = set di fieldPaths (es: "authData.name", "authData.email", ...)
- * - defaultAllowed è un set vuoto (di solito)
- * - rootFieldNames => set dei fieldName top-level (es. "findAllUsers")
- * - currentTypename => se l'oggetto non ha __typename, usiamo questo fallback
+ * Rimuove da `obj` i campi che non sono ammessi.
+ *
+ * - `allowedMap[typename]` = set di fieldPaths ammessi, es. "authData.name".
+ * - `defaultAllowed` di solito è vuoto
+ * - `rootFieldNames` = set di "findAllUsers", "findOneUser", ...
+ * - `currentTypename` = fallback se l'oggetto child non ha un suo `__typename`
+ *
+ * => Se un child ha un “__typename” sconosciuto, usiamo `currentTypename`.
  */
 function removeDisallowedMultiEntity(
   obj: any,
@@ -144,11 +165,10 @@ function removeDisallowedMultiEntity(
   logger: Logger,
   debug: boolean,
   currentTypename: string | undefined,
-  path = ''
+  path = '',
 ) {
   if (!obj || typeof obj !== 'object') return;
 
-  // (A) Se array => ricorsione su each
   if (Array.isArray(obj)) {
     for (const item of obj) {
       removeDisallowedMultiEntity(
@@ -159,30 +179,35 @@ function removeDisallowedMultiEntity(
         logger,
         debug,
         currentTypename,
-        path
+        path,
       );
     }
     return;
   }
 
-  // (B) Leggi (o eredita) il typename
+  // 1) Leggi __typename => fallback su currentTypename
   const ownTypename = obj.__typename as string | undefined;
-  const typename = ownTypename || currentTypename;
+  // se ownTypename non è in mappa => usiamo quello del parent
+  let finalTypename = ownTypename && allowedMap[ownTypename]
+    ? ownTypename
+    : currentTypename;
 
-  // se esiste typename in mappa => usalo, altrimenti => default
-  const isKnownEntity = typename && allowedMap[typename];
-  const setToUse = isKnownEntity ? allowedMap[typename!] : defaultAllowed;
+  // se pure finalTypename è undefined => useremo defaultAllowed
+  const isKnownEntity = finalTypename && allowedMap[finalTypename];
+  const setToUse = isKnownEntity ? allowedMap[finalTypename!] : defaultAllowed;
 
-  // (C) Itera i field
+  // 2) Itera i campi
   for (const fieldKey of Object.keys(obj)) {
-    // mantieni _id
-    if (fieldKey === '_id') continue;
+    if (fieldKey === '_id') {
+      // Manteniamo "_id" se vogliamo
+      continue;
+    }
 
     const subPath = path ? `${path}.${fieldKey}` : fieldKey;
     const val = obj[fieldKey];
 
     if (val && typeof val === 'object') {
-      // ricorsione => se l'oggetto child non ha __typename, erediterà `typename`
+      // ricorsione => passiamo finalTypename come “currentTypename”
       removeDisallowedMultiEntity(
         val,
         allowedMap,
@@ -190,22 +215,23 @@ function removeDisallowedMultiEntity(
         rootFieldNames,
         logger,
         debug,
-        typename,
+        finalTypename,
         subPath,
       );
-      // se il child risulta vuoto => rimuoviamo
       if (Object.keys(val).length === 0) {
         delete obj[fieldKey];
       }
     } else {
-      // normal field => verifichiamo se è consentito
-      // 1) rimuovo root field => "findAllUsers" -> "authData.name"
+      // normal field => verifichiamo se è ammesso
+      //  a) rimuovo eventuale rootField (es. "findAllUsers") => "authData.name"
       const finalPath = stripRootSegment(subPath, rootFieldNames);
 
       if (!setToUse.has(finalPath)) {
         if (debug) {
           logger.debug(
-            `remove => subPath="${subPath}" finalPath="${finalPath}" (typename="${typename}" known=${!!isKnownEntity})`
+            `remove => subPath="${subPath}" finalPath="${finalPath}" (typename="${
+              finalTypename || 'N/A'
+            }" known=${!!isKnownEntity})`,
           );
         }
         delete obj[fieldKey];
@@ -214,7 +240,9 @@ function removeDisallowedMultiEntity(
   }
 }
 
-/** Verifica Bearer M2M, se serve. */
+/**
+ * Se c'è un Bearer M2M e hai configurato Keycloak, verifichiamo la firma RS256
+ */
 async function verifyM2MToken(
   token: string,
   cfg: M2MVerificationConfig,
@@ -232,8 +260,12 @@ async function verifyM2MToken(
 
   const getKey = (header: any, callback: (err: any, key?: string) => void) => {
     jwksClient.getSigningKey(header.kid, (err, key) => {
-      if (err) return callback(err);
-      if (!key) return callback(new Error(`No signing key for kid=${header.kid}`));
+      if (err) {
+        return callback(err);
+      }
+      if (!key) {
+        return callback(new Error(`No signing key for kid=${header.kid}`));
+      }
       callback(null, key.getPublicKey());
     });
   };
@@ -251,10 +283,14 @@ async function verifyM2MToken(
       },
       (err) => {
         if (err) {
-          if (debug) logger.debug(`verifyM2MToken => error: ${err.message}`);
+          if (debug) {
+            logger.debug(`verifyM2MToken => error: ${err.message}`);
+          }
           return reject(err);
         }
-        if (debug) logger.debug('verifyM2MToken => success');
+        if (debug) {
+          logger.debug('verifyM2MToken => success');
+        }
         resolve();
       },
     );
@@ -262,7 +298,7 @@ async function verifyM2MToken(
 }
 
 /* -------------------------------------------------------------------------
- * 3) Plugin: createMultiEntityGrantsPlugin
+ * 3) Plugin “createMultiEntityGrantsPlugin”
  * ----------------------------------------------------------------------- */
 export function createMultiEntityGrantsPlugin(
   opts: MultiEntityGrantsOptions,
@@ -272,10 +308,10 @@ export function createMultiEntityGrantsPlugin(
   const parseGroups = opts.parseGroupIds ?? defaultParseGroups;
   const m2mConfig   = opts.m2mVerificationConfig;
 
-  // Per memorizzare i field root, es. "findAllUsers", "findOneUser", ...
+  // Qui salveremo i rootFields (es. "findAllUsers", "findOneUser", ecc.)
   let rootFieldNames = new Set<string>();
 
-  // Se ci sono funzioni federation
+  // Federation
   const FEDERATION_OPS = new Set([
     '_service',
     '__ApolloGetServiceDefinition__',
@@ -291,11 +327,14 @@ export function createMultiEntityGrantsPlugin(
     async requestDidStart() {
       if (debug) logger.debug('requestDidStart');
       return <GraphQLRequestListener<BaseContext>>{
-        // A) Controllo canExecute => didResolveOperation
+        /* ------------------------------------------------------
+         * 1) Controllo canExecute => didResolveOperation
+         * ------------------------------------------------------*/
         async didResolveOperation(rc: GraphQLRequestContextDidResolveOperation<BaseContext>) {
           if (debug) logger.debug('didResolveOperation => start');
 
-          // 1) Estrai root field names
+          // (A) Trova i field root (top-level) di questa operation
+          //     Esempio: "findAllUsers", "createUser", ecc.
           const selectionSet = rc.operation?.selectionSet;
           if (selectionSet && Array.isArray(selectionSet.selections)) {
             const topNames: string[] = [];
@@ -305,7 +344,7 @@ export function createMultiEntityGrantsPlugin(
               }
             }
             rootFieldNames = new Set(topNames);
-            if (debug) {
+            if (debug && rootFieldNames.size) {
               logger.debug(`rootFieldNames => [${[...rootFieldNames].join(', ')}]`);
             }
           }
@@ -315,11 +354,11 @@ export function createMultiEntityGrantsPlugin(
           if (debug) logger.debug(`rawOpName="${rawOpName}" => opName="${opName}"`);
 
           if (FEDERATION_OPS.has(rawOpName)) {
-            if (debug) logger.debug(`federation => bypass`);
+            if (debug) logger.debug('federation => bypass canExecute');
             return;
           }
 
-          // 2) Legge Authorization
+          // (B) Legge Authorization
           const headers = rc.request.http?.headers;
           if (!headers) return;
 
@@ -327,30 +366,30 @@ export function createMultiEntityGrantsPlugin(
           if (debug) logger.debug(`authHeader="${authHeader}"`);
 
           if (authHeader.toLowerCase().startsWith('bearer ')) {
-            // => M2M
+            // M2M => verifichiamo
             if (!m2mConfig) {
               throw new Error('Bearer M2M token presente, ma manca m2mVerificationConfig');
             }
             const token = authHeader.split(' ')[1];
             await verifyM2MToken(token, m2mConfig, logger, debug);
-            if (debug) logger.debug('M2M => skip x-user-groups');
+            if (debug) logger.debug('M2M => skip x-user-groups check');
             return;
           }
 
-          // 3) Altrimenti => x-user-groups
+          // (C) Altrimenti => x-user-groups
           const rawGroups = headers.get('x-user-groups');
           if (!rawGroups) {
             throw new Error(`[GrantsPlugin] Nessun M2M e nessun x-user-groups => denied (op=${opName})`);
           }
           const groups = parseGroups(rawGroups);
           if (!groups.length) {
-            throw new Error(`[GrantsPlugin] x-user-groups vuoto => denied`);
+            throw new Error(`[GrantsPlugin] x-user-groups vuoto => denied.`);
           }
           if (debug) {
             logger.debug(`groups => [${groups.join(', ')}]`);
           }
 
-          // 4) Check canExecute
+          // (D) check canExecute su almeno un group
           let canExe = false;
           try {
             canExe = await Promise.any(
@@ -372,7 +411,9 @@ export function createMultiEntityGrantsPlugin(
           if (debug) logger.debug(`op="${opName}" => canExe= true => proceed`);
         },
 
-        // B) Field-level => willSendResponse
+        /* ------------------------------------------------------
+         * 2) Field-level => willSendResponse
+         * ------------------------------------------------------*/
         async willSendResponse(rc: GraphQLRequestContextWillSendResponse<BaseContext>) {
           if (debug) logger.debug('willSendResponse => start');
 
@@ -395,19 +436,18 @@ export function createMultiEntityGrantsPlugin(
             return;
           }
 
-          // x-user-groups
+          // (A) parse x-user-groups
           const rawGroups = headers.get('x-user-groups');
           if (!rawGroups) return;
           const groups = parseGroups(rawGroups);
           if (!groups.length) return;
 
-          // 1) Prepara allowedMap
+          // (B) Costruiamo la mappa “typename => setOf(fieldPaths)”
           const allowedMap: Record<string, Set<string>> = {};
           const defaultAllowed = new Set<string>();
 
           for (const typename of Object.keys(opts.entityNameMap)) {
             const entityName = opts.entityNameMap[typename];
-            // union dei fieldPaths viewable per questi group
             const union = new Set<string>();
             for (const gId of groups) {
               const partial = await fetchViewable(opts.grantsClient, gId, entityName, logger, debug);
@@ -419,7 +459,7 @@ export function createMultiEntityGrantsPlugin(
             }
           }
 
-          // 2) Esegui filtering
+          // (C) Rimozione campi
           if (debug) {
             logger.debug(`Data BEFORE filtering:\n${JSON.stringify(data, null, 2)}`);
           }
@@ -428,10 +468,10 @@ export function createMultiEntityGrantsPlugin(
             data,
             allowedMap,
             defaultAllowed,
-            rootFieldNames, // passiamo i root fields
+            /* rootFieldNames */ rootFieldNames,
             logger,
             debug,
-            /* currentTypename */ undefined,
+            /* currentTypename= */ undefined,
           );
 
           if (debug) {

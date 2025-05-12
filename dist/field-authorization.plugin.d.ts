@@ -2,7 +2,7 @@ import { ApolloServerPlugin, BaseContext } from '@apollo/server';
 export interface GrantsClientLike {
     send<R = any, D = any>(pattern: any, data: D): import('rxjs').Observable<R>;
 }
-/** Config per token M2M Keycloak, se lo usi */
+/** Configurazione per la verifica M2M con Keycloak (o simili) */
 export interface M2MVerificationConfig {
     jwksUri: string;
     issuer: string;
@@ -10,8 +10,16 @@ export interface M2MVerificationConfig {
     allowedAlgos?: string[];
 }
 /**
- * Mappa: `__typename => entityName` usato in DB grants,
- * e opzioni per parseGroups, debug, ecc.
+ * Mappa: “__typename => nome usato su DB grants”
+ *
+ * Esempio:
+ * ```ts
+ * entityNameMap: {
+ *   User: "User",
+ *   Group: "Group",
+ *   // ...
+ * }
+ * ```
  */
 export interface MultiEntityGrantsOptions {
     grantsClient: GrantsClientLike;
