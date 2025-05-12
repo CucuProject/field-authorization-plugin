@@ -66,7 +66,11 @@ async function fetchViewable(client, groupId, entityName, logger, debug) {
 }
 /**
  * Rimuove i campi non consentiti in un oggetto con possibili __typename multipli.
- * Se l'oggetto figlio **non** ha `__typename`, lasceremo `typename = parentTypename`.
+ * Se l'oggetto figlio **non** ha `__typename`, lasceremo la `parentTypename`.
+ *
+ * In più, qui aggiungiamo una “sanitizzazione” del path per rimuovere
+ * il primo segmento (es. "findAllUsers."), perché su Grants i fieldPaths
+ * sono salvati come "authData.email" e non "findAllUsers.authData.email".
  */
 function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, logger, debug, parentTypename, path = '') {
     if (!obj || typeof obj !== 'object')
@@ -77,35 +81,44 @@ function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, logger, de
         }
         return;
     }
+    // __typename della “node”
     const nodeTypename = obj.__typename;
-    // se non c’è __typename => assumiamo parentTypename
+    // se non c’è => ereditiamo quello del parent
     const typename = nodeTypename || parentTypename;
     const isKnownEntity = typename && allowedMap[typename];
-    // Se la “entity” non è conosciuta => useremo defaultAllowed
-    const setToUse = isKnownEntity
-        ? allowedMap[typename]
-        : defaultAllowed;
     if (debug && nodeTypename && !isKnownEntity) {
-        logger.debug(`Typename "${nodeTypename}" non è in entityNameMap => fallback a parent="${parentTypename}"`);
+        logger.debug(`Typename "${nodeTypename}" non è in entityNameMap => fallback a parent="${parentTypename || 'N/A'}"`);
     }
-    for (const k of Object.keys(obj)) {
-        if (k === '_id')
-            continue; // mantieni _id se vuoi
-        const subPath = path ? `${path}.${k}` : k;
-        const val = obj[k];
+    for (const key of Object.keys(obj)) {
+        if (key === '_id')
+            continue; // tieni _id se vuoi
+        const subPath = path ? `${path}.${key}` : key;
+        const val = obj[key];
         if (val && typeof val === 'object') {
-            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, logger, debug, typename, // passiamo questo typename come "parent" per i figli
-            subPath);
+            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, logger, debug, typename, subPath);
             if (Object.keys(val).length === 0) {
-                delete obj[k];
+                delete obj[key];
             }
         }
         else {
-            if (!setToUse.has(subPath)) {
+            // 1) Rimuove il primo segmento (es: "findAllUsers.") se esiste
+            //    e se c’è almeno un punto.
+            let sanitized = subPath;
+            const dotIndex = sanitized.indexOf('.');
+            if (dotIndex > 0) {
+                // Rimuove tutto fino al primo punto => "findAllUsers.authData" => "authData"
+                sanitized = sanitized.substring(dotIndex + 1);
+            }
+            // Esempio: "findAllUsers.authData.name" => "authData.name"
+            // 2) Decidi quale set usare
+            const setToUse = isKnownEntity
+                ? allowedMap[typename]
+                : defaultAllowed;
+            if (!setToUse.has(sanitized)) {
                 if (debug) {
-                    logger.debug(`remove => subPath="${subPath}" (finalPath="${k}") (typename="${typename || 'N/A'}" known=${!!isKnownEntity})`);
+                    logger.debug(`remove => subPath="${subPath}" (finalPath="${sanitized}") (typename="${typename || 'N/A'}" known=${!!isKnownEntity})`);
                 }
-                delete obj[k];
+                delete obj[key];
             }
         }
     }
@@ -166,6 +179,9 @@ function createMultiEntityGrantsPlugin(opts) {
             if (debug)
                 logger.debug('requestDidStart');
             return {
+                /* ------------------------------------------------------
+                 * 1) Controllo canExecute => didResolveOperation
+                 * ------------------------------------------------------*/
                 async didResolveOperation(rc) {
                     if (debug)
                         logger.debug('didResolveOperation => start');
@@ -176,6 +192,7 @@ function createMultiEntityGrantsPlugin(opts) {
                         return;
                     }
                     const rawOpName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+                    // Rimuove eventuali suffix Federation
                     const opName = rawOpName.replace(/__\w+__\d+$/, '');
                     if (debug)
                         logger.debug(`rawOpName="${rawOpName}" => opName="${opName}"`);
@@ -234,6 +251,9 @@ function createMultiEntityGrantsPlugin(opts) {
                     if (debug)
                         logger.debug(`op="${opName}" => canExe = true => proceed`);
                 },
+                /* ------------------------------------------------------
+                 * 2) Field-level => willSendResponse
+                 * ------------------------------------------------------*/
                 async willSendResponse(rc) {
                     if (debug)
                         logger.debug('willSendResponse => start');
@@ -260,13 +280,14 @@ function createMultiEntityGrantsPlugin(opts) {
                             logger.debug('... federation => skip field filtering');
                         return;
                     }
-                    // Se Bearer M2M => skip
+                    // Se Bearer M2M => skip field-level
                     const authHeader = headers.get('authorization') || '';
                     if (authHeader.toLowerCase().startsWith('bearer ')) {
                         if (debug)
                             logger.debug('... bearer M2M => skip field filtering');
                         return;
                     }
+                    // x-user-groups
                     const rawGroups = headers.get('x-user-groups');
                     if (!rawGroups) {
                         if (debug)
@@ -281,10 +302,10 @@ function createMultiEntityGrantsPlugin(opts) {
                     }
                     // 1) costruiamo "allowedMap"
                     const allowedMap = {};
-                    const defaultAllowed = new Set(); // fallback se typename non matcha
+                    const defaultAllowed = new Set();
                     for (const typename of Object.keys(opts.entityNameMap)) {
                         const entityName = opts.entityNameMap[typename];
-                        // union dei fieldPaths per i vari groupIds
+                        // union dei fieldPaths
                         const unionFields = new Set();
                         for (const gId of groups) {
                             const partial = await fetchViewable(opts.grantsClient, gId, entityName, logger, debug);
@@ -298,7 +319,6 @@ function createMultiEntityGrantsPlugin(opts) {
                     if (debug) {
                         logger.debug(`Data BEFORE filtering:\n${JSON.stringify(data, null, 2)}`);
                     }
-                    // 2) Rimuovi i campi
                     removeDisallowedMultiEntity(data, allowedMap, defaultAllowed, logger, debug, 
                     /* parentTypename= */ undefined);
                     if (debug) {

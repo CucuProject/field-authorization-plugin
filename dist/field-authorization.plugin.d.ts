@@ -12,19 +12,19 @@ export interface M2MVerificationConfig {
 /**
  * Mappa per la field-level security:
  *   __typename => nomeEntityUsatoSuDB
- * Esempio:
+ * Esempio tipico (nel tuo caso):
  *   entityNameMap: {
  *     User: "User",
- *     AuthDataSchema: "User",
+ *     AuthDataSchema: "User",   // i sub-tipi tutti su “User”
+ *     PersonalDataSchema: "User",
  *     ...
  *   }
  */
 export interface MultiEntityGrantsOptions {
     grantsClient: GrantsClientLike;
     /**
-     * Mappa di tutti i typename “realmente usati a runtime”
-     * nel supergraph (inclusi i sub–object con __typename),
-     * verso la “entityName” corrispondente su DB Grants.
+     * Elenco di tutti i __typename che compaiono nel supergraph
+     * e come vuoi che vengano interpretati su DB Grants.
      */
     entityNameMap: Record<string, string>;
     parseGroupIds?: (raw?: string | null) => string[];
