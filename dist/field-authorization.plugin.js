@@ -9,7 +9,7 @@ const jsonwebtoken_1 = require("jsonwebtoken");
 const jwks_rsa_1 = __importDefault(require("jwks-rsa"));
 const rxjs_1 = require("rxjs");
 /* -------------------------------------------------------------------------
- * 2) Helpers per op e field-level
+ * 2) Helpers
  * ----------------------------------------------------------------------- */
 /** parse x-user-groups di default */
 function defaultParseGroups(raw) {
@@ -17,9 +17,7 @@ function defaultParseGroups(raw) {
         ? raw.split(',').map(s => s.trim()).filter(Boolean)
         : [];
 }
-/**
- * Verifica canExecute su un'operazione
- */
+/** Verifica canExecute su un'operazione */
 async function checkCanExecute(client, groupId, opName, logger, debug) {
     if (debug) {
         logger.debug(`checkCanExecute => groupId="${groupId}", opName="${opName}"`);
@@ -39,10 +37,7 @@ async function checkCanExecute(client, groupId, opName, logger, debug) {
         return false;
     }
 }
-/**
- * Carica i fieldPaths “viewable” (canView=true) da DB grants
- * per (groupId, entityName).
- */
+/** Carica i fieldPaths “viewable” da DB grants (groupId, entityName). */
 async function fetchViewable(client, groupId, entityName, logger, debug) {
     if (debug) {
         logger.debug(`fetchViewable => groupId="${groupId}", entityName="${entityName}"`);
@@ -63,29 +58,20 @@ async function fetchViewable(client, groupId, entityName, logger, debug) {
     }
 }
 /**
- * Se la prima parte del path corrisponde a un rootField, rimuovila.
- *
- * Esempio: "findAllUsers.authData.name"
- * =>  rootFieldName="findAllUsers"
- * =>  ritorna "authData.name"
+ * Se la prima parte del path corrisponde a un rootField (es. "findAllUsers"),
+ * la rimuove. Esempio: "findAllUsers.authData.email" => "authData.email".
  */
 function stripRootSegment(fullPath, rootFieldNames) {
     const parts = fullPath.split('.');
     if (parts.length > 1 && rootFieldNames.has(parts[0])) {
-        // rimuove la parte iniziale
-        parts.shift();
+        parts.shift(); // toglie la parte iniziale (es. "findAllUsers")
     }
     return parts.join('.');
 }
 /**
- * Rimuove da `obj` i campi che non sono ammessi.
- *
- * - `allowedMap[typename]` = set di fieldPaths ammessi, es. "authData.name".
- * - `defaultAllowed` di solito è vuoto
- * - `rootFieldNames` = set di "findAllUsers", "findOneUser", ...
- * - `currentTypename` = fallback se l'oggetto child non ha un suo `__typename`
- *
- * => Se un child ha un “__typename” sconosciuto, usiamo `currentTypename`.
+ * Rimuove i campi non ammessi da `obj`.
+ * - fallback: se child ha `__typename` sconosciuto, usiamo `parentTypename`.
+ * - stripRootSegment: rimuove la parte "findAllUsers" se presente dal path.
  */
 function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, rootFieldNames, logger, debug, currentTypename, path = '') {
     if (!obj || typeof obj !== 'object')
@@ -96,33 +82,32 @@ function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, rootFieldN
         }
         return;
     }
-    // 1) Leggi __typename => fallback su currentTypename
+    // Leggiamo eventuale __typename
     const ownTypename = obj.__typename;
-    // se ownTypename non è in mappa => usiamo quello del parent
+    // Se "ownTypename" non è in mappa => fallback a "currentTypename"
     let finalTypename = ownTypename && allowedMap[ownTypename]
         ? ownTypename
         : currentTypename;
-    // se pure finalTypename è undefined => useremo defaultAllowed
+    // Se non c'è, usiamo defaultAllowed
     const isKnownEntity = finalTypename && allowedMap[finalTypename];
     const setToUse = isKnownEntity ? allowedMap[finalTypename] : defaultAllowed;
-    // 2) Itera i campi
     for (const fieldKey of Object.keys(obj)) {
         if (fieldKey === '_id') {
-            // Manteniamo "_id" se vogliamo
+            // tieni _id
             continue;
         }
         const subPath = path ? `${path}.${fieldKey}` : fieldKey;
         const val = obj[fieldKey];
         if (val && typeof val === 'object') {
-            // ricorsione => passiamo finalTypename come “currentTypename”
-            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, rootFieldNames, logger, debug, finalTypename, subPath);
+            removeDisallowedMultiEntity(val, allowedMap, defaultAllowed, rootFieldNames, logger, debug, finalTypename, // child eredita il typename dal parent se non ne ha uno suo
+            subPath);
             if (Object.keys(val).length === 0) {
                 delete obj[fieldKey];
             }
         }
         else {
-            // normal field => verifichiamo se è ammesso
-            //  a) rimuovo eventuale rootField (es. "findAllUsers") => "authData.name"
+            // E' un field "atomico"
+            // Rimuovo l'eventuale rootSegment
             const finalPath = stripRootSegment(subPath, rootFieldNames);
             if (!setToUse.has(finalPath)) {
                 if (debug) {
@@ -134,7 +119,7 @@ function removeDisallowedMultiEntity(obj, allowedMap, defaultAllowed, rootFieldN
     }
 }
 /**
- * Se c'è un Bearer M2M e hai configurato Keycloak, verifichiamo la firma RS256
+ * Verifica Bearer M2M (Keycloak) => RS256
  */
 async function verifyM2MToken(token, cfg, logger, debug) {
     if (debug) {
@@ -184,8 +169,6 @@ function createMultiEntityGrantsPlugin(opts) {
     const debug = !!opts.debug;
     const parseGroups = opts.parseGroupIds ?? defaultParseGroups;
     const m2mConfig = opts.m2mVerificationConfig;
-    // Qui salveremo i rootFields (es. "findAllUsers", "findOneUser", ecc.)
-    let rootFieldNames = new Set();
     // Federation
     const FEDERATION_OPS = new Set([
         '_service',
@@ -200,15 +183,30 @@ function createMultiEntityGrantsPlugin(opts) {
         async requestDidStart() {
             if (debug)
                 logger.debug('requestDidStart');
+            // useremo queste var per passare info dal didResolveOperation al willSendResponse
+            let rootFieldNames = new Set();
+            let rootTypename;
             return {
-                /* ------------------------------------------------------
-                 * 1) Controllo canExecute => didResolveOperation
-                 * ------------------------------------------------------*/
+                /* ===============================================================
+                 * A) canExecute => didResolveOperation
+                 * ============================================================= */
                 async didResolveOperation(rc) {
                     if (debug)
                         logger.debug('didResolveOperation => start');
-                    // (A) Trova i field root (top-level) di questa operation
-                    //     Esempio: "findAllUsers", "createUser", ecc.
+                    const rawOpName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
+                    const opName = rawOpName.replace(/__\w+__\d+$/, '');
+                    if (FEDERATION_OPS.has(rawOpName)) {
+                        if (debug)
+                            logger.debug('federation => bypass canExecute');
+                        return;
+                    }
+                    // rootTypenameMap => se definito, associamo quell'opName a un typename
+                    if (opts.rootTypenameMap && opts.rootTypenameMap[opName]) {
+                        rootTypename = opts.rootTypenameMap[opName];
+                        if (debug)
+                            logger.debug(`opName="${opName}" => rootTypename="${rootTypename}"`);
+                    }
+                    // estraiamo i rootFieldNames dal selectionSet
                     const selectionSet = rc.operation?.selectionSet;
                     if (selectionSet && Array.isArray(selectionSet.selections)) {
                         const topNames = [];
@@ -218,50 +216,40 @@ function createMultiEntityGrantsPlugin(opts) {
                             }
                         }
                         rootFieldNames = new Set(topNames);
-                        if (debug && rootFieldNames.size) {
-                            logger.debug(`rootFieldNames => [${[...rootFieldNames].join(', ')}]`);
+                        if (debug && topNames.length) {
+                            logger.debug(`rootFieldNames=[${topNames.join(', ')}]`);
                         }
                     }
-                    const rawOpName = rc.operationName ?? rc.operation?.name?.value ?? 'UnnamedOperation';
-                    const opName = rawOpName.replace(/__\w+__\d+$/, '');
-                    if (debug)
-                        logger.debug(`rawOpName="${rawOpName}" => opName="${opName}"`);
-                    if (FEDERATION_OPS.has(rawOpName)) {
-                        if (debug)
-                            logger.debug('federation => bypass canExecute');
-                        return;
-                    }
-                    // (B) Legge Authorization
                     const headers = rc.request.http?.headers;
                     if (!headers)
                         return;
                     const authHeader = headers.get('authorization') || '';
                     if (debug)
                         logger.debug(`authHeader="${authHeader}"`);
+                    // 1) Bearer => M2M?
                     if (authHeader.toLowerCase().startsWith('bearer ')) {
-                        // M2M => verifichiamo
                         if (!m2mConfig) {
                             throw new Error('Bearer M2M token presente, ma manca m2mVerificationConfig');
                         }
                         const token = authHeader.split(' ')[1];
                         await verifyM2MToken(token, m2mConfig, logger, debug);
                         if (debug)
-                            logger.debug('M2M => skip x-user-groups check');
+                            logger.debug('M2M => skip x-user-groups');
                         return;
                     }
-                    // (C) Altrimenti => x-user-groups
+                    // 2) Altrimenti => x-user-groups
                     const rawGroups = headers.get('x-user-groups');
                     if (!rawGroups) {
-                        throw new Error(`[GrantsPlugin] Nessun M2M e nessun x-user-groups => denied (op=${opName})`);
+                        throw new Error(`[GrantsPlugin] No M2M e no x-user-groups => denied (op=${opName})`);
                     }
                     const groups = parseGroups(rawGroups);
                     if (!groups.length) {
                         throw new Error(`[GrantsPlugin] x-user-groups vuoto => denied.`);
                     }
                     if (debug) {
-                        logger.debug(`groups => [${groups.join(', ')}]`);
+                        logger.debug(`groups=[${groups.join(', ')}]`);
                     }
-                    // (D) check canExecute su almeno un group
+                    // check canExecute
                     let canExe = false;
                     try {
                         canExe = await Promise.any(groups.map(g => checkCanExecute(opts.grantsClient, g, opName, logger, debug)));
@@ -273,17 +261,16 @@ function createMultiEntityGrantsPlugin(opts) {
                         canExe = false;
                     }
                     if (!canExe) {
-                        if (debug) {
+                        if (debug)
                             logger.debug(`op="${opName}" => denied => groups=[${groups.join(',')}]`);
-                        }
                         throw new Error(`[GrantsPlugin] Operazione "${opName}" non consentita per i gruppi [${groups.join(',')}]`);
                     }
                     if (debug)
                         logger.debug(`op="${opName}" => canExe= true => proceed`);
                 },
-                /* ------------------------------------------------------
-                 * 2) Field-level => willSendResponse
-                 * ------------------------------------------------------*/
+                /* ===============================================================
+                 * B) field-level => willSendResponse
+                 * ============================================================= */
                 async willSendResponse(rc) {
                     if (debug)
                         logger.debug('willSendResponse => start');
@@ -298,7 +285,7 @@ function createMultiEntityGrantsPlugin(opts) {
                             logger.debug('federation => skip field filtering');
                         return;
                     }
-                    // Se Bearer M2M => skip
+                    // Bearer M2M => skip
                     const headers = rc.request.http?.headers;
                     if (!headers)
                         return;
@@ -308,16 +295,17 @@ function createMultiEntityGrantsPlugin(opts) {
                             logger.debug('M2M => skip field filtering');
                         return;
                     }
-                    // (A) parse x-user-groups
+                    // parse x-user-groups
                     const rawGroups = headers.get('x-user-groups');
                     if (!rawGroups)
                         return;
                     const groups = parseGroups(rawGroups);
                     if (!groups.length)
                         return;
-                    // (B) Costruiamo la mappa “typename => setOf(fieldPaths)”
+                    // Creiamo la mappa “typename => setOf(fieldPaths)”
                     const allowedMap = {};
                     const defaultAllowed = new Set();
+                    // Popoliamo i fieldPaths uniti
                     for (const typename of Object.keys(opts.entityNameMap)) {
                         const entityName = opts.entityNameMap[typename];
                         const union = new Set();
@@ -330,13 +318,14 @@ function createMultiEntityGrantsPlugin(opts) {
                             logger.debug(`typename="${typename}" => unionFields=[${[...union].join(', ')}]`);
                         }
                     }
-                    // (C) Rimozione campi
                     if (debug) {
                         logger.debug(`Data BEFORE filtering:\n${JSON.stringify(data, null, 2)}`);
                     }
+                    // Se in didResolveOperation abbiamo impostato rootTypename
+                    // (es. "User" per findAllUsers), lo passiamo
                     removeDisallowedMultiEntity(data, allowedMap, defaultAllowed, 
-                    /* rootFieldNames */ rootFieldNames, logger, debug, 
-                    /* currentTypename= */ undefined);
+                    /* rootFieldNames= */ rootFieldNames, logger, debug, 
+                    /* currentTypename= */ rootTypename);
                     if (debug) {
                         logger.debug(`Data AFTER filtering:\n${JSON.stringify(data, null, 2)}`);
                     }
