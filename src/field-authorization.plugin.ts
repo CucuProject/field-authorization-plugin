@@ -236,11 +236,11 @@ async function verifyM2MToken(token: string, cfg: M2MVerificationConfig, logger:
       token,
       getKey,
       {
-        audience: cfg.audience,
+        audience: Array.isArray(cfg.audience) ? cfg.audience as [string, ...string[]] : cfg.audience,
         issuer:   cfg.issuer,
         algorithms: algos,
       },
-      (err) => {
+      (err: any) => {
         if (err) {
           if (debug) logger.debug(`verifyM2MToken => error: ${err?.message || err}`);
           return reject(err);
