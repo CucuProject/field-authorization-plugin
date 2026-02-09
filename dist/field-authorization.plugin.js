@@ -146,7 +146,7 @@ async function verifyM2MToken(token, cfg, logger, debug) {
     const algos = (cfg.allowedAlgos || ['RS256']);
     return new Promise((resolve, reject) => {
         (0, jsonwebtoken_1.verify)(token, getKey, {
-            audience: cfg.audience,
+            audience: Array.isArray(cfg.audience) ? cfg.audience : cfg.audience,
             issuer: cfg.issuer,
             algorithms: algos,
         }, (err) => {
