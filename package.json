@@ -11,7 +11,7 @@
     "clean": "rimraf dist node_modules"
   },
   "dependencies": {
-    "@apollo/server": "^4.13.0",
+    "@apollo/server": "^5.0.0",
     "rxjs": "^7.8.1",
     "jsonwebtoken": "^9.0.2",
     "jwks-rsa": "^3.2.0"
